@@ -69,8 +69,8 @@ func (c *Controller) Sync(ctx context.Context) error {
         return fmt.Errorf("list deployments: %w", err)
     }
 
-    // 列出本节点上的 Pods（通过 fieldSelector 过滤）
-    podList, err := c.client.CoreV1().Pods("").List(ctx, metav1.ListOptions{FieldSelector: "spec.nodeName=" + c.nodeName})
+    // 列出全量 Pods（用于构建跨节点来源/去向白名单）
+    podList, err := c.client.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
     if err != nil {
         return fmt.Errorf("list pods: %w", err)
     }
@@ -87,12 +87,18 @@ func (c *Controller) Sync(ctx context.Context) error {
         depSelectors[key] = sel
     }
 
-    // 遍历本节点上的 Pod，判断其匹配哪些 Deployment，并收集每个 Deployment 在本节点上的 Pod IP
-    depPodIPs := map[DeploymentKey][]string{}
+    // 遍历 Pods，判断其匹配哪些 Deployment，并分别收集：
+    // - 全量 Pod IP（用于跨节点白名单匹配）
+    // - 本节点 Pod IP（用于本节点链规则）
+    depPodIPsAll := map[DeploymentKey][]string{}
+    depPodIPsLocal := map[DeploymentKey][]string{}
     for _, p := range podList.Items {
         for key, sel := range depSelectors {
             if sel.Matches(labels.Set(p.Labels)) {
-                depPodIPs[key] = append(depPodIPs[key], p.Status.PodIP)
+                depPodIPsAll[key] = append(depPodIPsAll[key], p.Status.PodIP)
+                if p.Spec.NodeName == c.nodeName {
+                    depPodIPsLocal[key] = append(depPodIPsLocal[key], p.Status.PodIP)
+                }
             }
         }
     }
@@ -100,51 +106,109 @@ func (c *Controller) Sync(ctx context.Context) error {
     // 从内存策略存储读取当前策略（由 API 下发）
     policy := c.policyStore.Get()
 
-    // 确保根链存在并在 FORWARD 链插入跳转点
-    rootChain := iptables.MakeChainName(c.prefix, "ROOT", "CHAIN")
-    if err := iptables.EnsureChain(rootChain); err != nil {
-        return fmt.Errorf("ensure root chain: %w", err)
+    // 确保入向/出向根链存在并在 FORWARD 链插入跳转点
+    rootChainIn := iptables.MakeChainName(c.prefix, "ROOT", "IN")
+    rootChainOut := iptables.MakeChainName(c.prefix, "ROOT", "OUT")
+    if err := iptables.EnsureChain(rootChainOut); err != nil {
+        return fmt.Errorf("ensure root out chain: %w", err)
     }
-    if err := iptables.EnsureJump(rootChain, c.forwardJumpPosition); err != nil {
-        return fmt.Errorf("ensure jump: %w", err)
+    if err := iptables.EnsureChain(rootChainIn); err != nil {
+        return fmt.Errorf("ensure root in chain: %w", err)
+    }
+    // 顺序：先出向（OUT）再入向（IN），保证先进行出向控制，再做入向控制
+    // insert 情况下需要先插入 IN 再插入 OUT，才能保证 OUT 在更靠前的位置。
+    if c.forwardJumpPosition == "insert" {
+        if err := iptables.EnsureJump(rootChainIn, c.forwardJumpPosition); err != nil {
+            return fmt.Errorf("ensure jump in: %w", err)
+        }
+        if err := iptables.EnsureJump(rootChainOut, c.forwardJumpPosition); err != nil {
+            return fmt.Errorf("ensure jump out: %w", err)
+        }
+    } else {
+        if err := iptables.EnsureJump(rootChainOut, c.forwardJumpPosition); err != nil {
+            return fmt.Errorf("ensure jump out: %w", err)
+        }
+        if err := iptables.EnsureJump(rootChainIn, c.forwardJumpPosition); err != nil {
+            return fmt.Errorf("ensure jump in: %w", err)
+        }
     }
 
     // 收集所有需要挂接到 rootChain 的专用链名
-    desiredChains := []string{}
+    desiredChainsIn := []string{}
+    desiredChainsOut := []string{}
 
-    // 对于每个在本节点运行的 Deployment，创建/更新专用链并添加允许该 Deployment Pod IP 的规则
-    for depKey, ips := range depPodIPs {
-        if len(ips) == 0 {
+    // 对于每个在本节点运行的 Deployment，创建/更新入向/出向专用链
+    for depKey, localIPs := range depPodIPsLocal {
+        if len(localIPs) == 0 {
             continue
         }
         // 使用结构化字段，避免字符串解析误差
         ns, name := depKey.Namespace, depKey.Name
-        chain := iptables.MakeChainName(c.prefix, ns, name)
-        desiredChains = append(desiredChains, chain)
-        if err := iptables.EnsureChain(chain); err != nil {
-            log.Printf("ensure chain %s: %v", chain, err)
+        chainIn := iptables.MakeChainName(c.prefix, "IN", ns+"-"+name)
+        chainOut := iptables.MakeChainName(c.prefix, "OUT", ns+"-"+name)
+        desiredChainsIn = append(desiredChainsIn, chainIn)
+        desiredChainsOut = append(desiredChainsOut, chainOut)
+        if err := iptables.EnsureChain(chainIn); err != nil {
+            log.Printf("ensure chain %s: %v", chainIn, err)
+            continue
+        }
+        if err := iptables.EnsureChain(chainOut); err != nil {
+            log.Printf("ensure chain %s: %v", chainOut, err)
             continue
         }
 
-        // 在专用链中根据外部策略生成规则：
-        // - 默认将规则作用于目的地址（-d PodIP），以实现对该 Deployment 的访问控制。
-        // - 规则来源于 ConfigMap 中该 Deployment 的策略；若没有规则则应用 defaultAction。
-        rules := buildRulesForDeployment(ips, &policy, ns, name)
+        depPolicy := findDeploymentPolicy(&policy, ns, name)
+        srcSetName := ""
+        dstSetName := ""
+        if depPolicy != nil && len(depPolicy.IngressFrom) > 0 {
+            srcSetName = iptables.MakeSetName(c.prefix, "SRC", ns+"-"+name)
+            allowedSrcIPs := collectPeerIPs(depPolicy.IngressFrom, depPodIPsAll)
+            if err := iptables.SyncIPSet(srcSetName, allowedSrcIPs); err != nil {
+                log.Printf("sync ipset %s: %v", srcSetName, err)
+            }
+        }
+        if depPolicy != nil && len(depPolicy.EgressTo) > 0 {
+            dstSetName = iptables.MakeSetName(c.prefix, "DST", ns+"-"+name)
+            allowedDstIPs := collectPeerIPs(depPolicy.EgressTo, depPodIPsAll)
+            if err := iptables.SyncIPSet(dstSetName, allowedDstIPs); err != nil {
+                log.Printf("sync ipset %s: %v", dstSetName, err)
+            }
+        }
 
-        if _, err := iptables.SyncRules(chain, rules); err != nil {
-            log.Printf("sync rules for %s: %v", chain, err)
+        ingressRules := buildIngressRules(localIPs, &policy, ns, name, srcSetName)
+        if _, err := iptables.SyncRules(chainIn, ingressRules); err != nil {
+            log.Printf("sync rules for %s: %v", chainIn, err)
+            continue
+        }
+
+        egressRules := buildEgressRules(localIPs, ns, name, dstSetName)
+        if _, err := iptables.SyncRules(chainOut, egressRules); err != nil {
+            log.Printf("sync rules for %s: %v", chainOut, err)
             continue
         }
     }
 
     // 用最新的专用链列表重建 rootChain，避免历史残留链导致策略失效
-    sort.Strings(desiredChains)
-    rootRules := [][]string{}
-    for _, chain := range desiredChains {
-        rootRules = append(rootRules, []string{"-j", chain})
+    sort.Strings(desiredChainsIn)
+    sort.Strings(desiredChainsOut)
+    rootRulesIn := [][]string{}
+    rootRulesOut := [][]string{}
+
+    // 放行已建立/相关连接的返回流量，避免白名单误拦截回包
+    establishedRule := []string{"-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"}
+    rootRulesOut = append(rootRulesOut, establishedRule)
+    rootRulesIn = append(rootRulesIn, establishedRule)
+    for _, chain := range desiredChainsIn {
+        rootRulesIn = append(rootRulesIn, []string{"-j", chain})
     }
-    if _, err := iptables.SyncRules(rootChain, rootRules); err != nil {
-        log.Printf("sync rules for %s: %v", rootChain, err)
+    for _, chain := range desiredChainsOut {
+        rootRulesOut = append(rootRulesOut, []string{"-j", chain})
+    }
+    if _, err := iptables.SyncRules(rootChainIn, rootRulesIn); err != nil {
+        log.Printf("sync rules for %s: %v", rootChainIn, err)
+    }
+    if _, err := iptables.SyncRules(rootChainOut, rootRulesOut); err != nil {
+        log.Printf("sync rules for %s: %v", rootChainOut, err)
     }
 
     log.Printf("sync completed for node %s", c.nodeName)

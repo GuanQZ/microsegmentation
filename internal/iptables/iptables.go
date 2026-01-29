@@ -95,6 +95,39 @@ func SyncRules(chain string, rules [][]string) (changed bool, err error) {
     return true, nil
 }
 
+// EnsureIPSet 确保给定的 ipset 存在；若不存在则创建。
+// 说明：使用 hash:ip 类型保存 IP 列表，适用于白名单集合。
+func EnsureIPSet(setName string) error {
+    if strings.TrimSpace(setName) == "" {
+        return nil
+    }
+    _, err := RunCommand("ipset", "create", setName, "hash:ip", "-exist")
+    return err
+}
+
+// SyncIPSet 用给定的 IP 列表替换指定 ipset 的内容。
+// 行为：先 flush，再逐条 add（使用 -exist 避免重复错误）。
+func SyncIPSet(setName string, ips []string) error {
+    if strings.TrimSpace(setName) == "" {
+        return nil
+    }
+    if err := EnsureIPSet(setName); err != nil {
+        return err
+    }
+    if _, err := RunCommand("ipset", "flush", setName); err != nil {
+        return err
+    }
+    for _, ip := range ips {
+        if strings.TrimSpace(ip) == "" {
+            continue
+        }
+        if _, err := RunCommand("ipset", "add", setName, ip, "-exist"); err != nil {
+            return err
+        }
+    }
+    return nil
+}
+
 // MakeChainName 根据前缀、命名空间和名称生成合法的 iptables 链名。
 // 说明：
 // - iptables 链名长度通常受限（不同内核/iptables 版本略有差异，常见限制约为 28），因此这里对生成的链名做截断以保证兼容性。
@@ -106,6 +139,18 @@ func MakeChainName(prefix, ns, name string) string {
         base = base[:26]
     }
     // replace invalid chars
+    base = strings.ReplaceAll(base, "/", "-")
+    base = strings.ReplaceAll(base, ":", "-")
+    return strings.ToUpper(base)
+}
+
+// MakeSetName 根据前缀、用途与名称生成合法的 ipset 名称。
+// 说明：ipset 名称长度限制通常为 31，这里做截断以保证兼容性。
+func MakeSetName(prefix, role, name string) string {
+    base := fmt.Sprintf("%s-%s-%s", prefix, role, name)
+    if len(base) > 28 {
+        base = base[:28]
+    }
     base = strings.ReplaceAll(base, "/", "-")
     base = strings.ReplaceAll(base, ":", "-")
     return strings.ToUpper(base)

@@ -72,6 +72,37 @@ echo $WEB_POD_IP
 kubectl -n default delete pod client --ignore-not-found
 kubectl -n default run client --image=curlimages/curl --restart=Never --command -- sleep 3600
 kubectl -n default get pod client -o wide
+
+```
+
+## 四点五、准备一个“客户端 Deployment”（用于出向测试）
+
+```bash
+cat <<'EOF' > /tmp/client-deploy.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: client
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: client
+  template:
+    metadata:
+      labels:
+        app: client
+    spec:
+      containers:
+        - name: curl
+          image: curlimages/curl
+          command: ["sleep", "3600"]
+EOF
+
+kubectl apply -f /tmp/client-deploy.yaml
+kubectl rollout status deployment/client --timeout=120s
+```
 ```
 
 ## 五、测试“拒绝”行为
@@ -80,7 +111,7 @@ kubectl -n default get pod client -o wide
 
 ```bash
 kubectl -n ms-iptables run curl --image=curlimages/curl --restart=Never --command -- \
-  curl -sS -X PUT http://ms-iptables-api.ms-iptables.svc.cluster.local:18080/policy \
+  curl -sS -X POST http://ms-iptables-api.ms-iptables.svc.cluster.local:18080/apply \
   -H 'Content-Type: application/json' \
   -d '{"defaultAction":"ALLOW","deployments":[{"namespace":"default","name":"web","rules":[{"action":"ALLOW","srcCIDR":"10.244.0.0/24","protocol":"tcp","port":80},{"action":"DENY","srcCIDR":"0.0.0.0/0"}]}]}'
 
@@ -105,7 +136,7 @@ kubectl -n default exec client -- \
 
 ```bash
 kubectl -n ms-iptables run curl --image=curlimages/curl --restart=Never --command -- \
-  curl -sS -X PUT http://ms-iptables-api.ms-iptables.svc.cluster.local:18080/policy \
+  curl -sS -X POST http://ms-iptables-api.ms-iptables.svc.cluster.local:18080/apply \
   -H 'Content-Type: application/json' \
   -d '{"defaultAction":"ALLOW","deployments":[{"namespace":"default","name":"web","rules":[{"action":"ALLOW","srcCIDR":"10.244.0.0/16","protocol":"tcp","port":80},{"action":"DENY","srcCIDR":"0.0.0.0/0"}]}]}'
 
@@ -126,6 +157,8 @@ kubectl -n default exec client -- \
 ## 七、Service 场景测试（ClusterIP）
 
 > 目的：验证通过 Service 访问时策略是否生效。
+> 说明：当前仅在 filter/FORWARD 链生效，部分 kube-proxy 场景可能绕过（尤其是本机/OUTPUT 路径）。
+> 若出现与预期不一致，以 PodIP 场景为准；如需 Service/DNS 严格生效，可扩展到 OUTPUT/INPUT 链。
 
 1) 创建或确认 Service：
 
@@ -158,6 +191,7 @@ kubectl -n default exec client -- \
 ## 八、DNS 场景测试（Service DNS）
 
 > 目的：验证通过 DNS 访问时策略是否生效。
+> 说明：同上，受 kube-proxy 链路影响可能不生效。
 
 1) 允许策略访问 DNS：
 
@@ -247,11 +281,47 @@ kubectl -n default exec client -- \
 - 允许策略：`HTTP:200`
 - 拒绝策略：`HTTP:000` + 超时
 
-## 十、检查 iptables 规则（可选）
+## 十、出向白名单测试（egress）
+
+> 目的：验证“client 只能访问 web”的出向白名单生效。
+
+1) 下发策略：仅允许 client 访问 web
 
 ```bash
-docker exec -i ms-dev-control-plane iptables -S MS-ROOT-CHAIN
-docker exec -i ms-dev-control-plane iptables -S MS-DEFAULT-WEB
+kubectl -n ms-iptables run curl --image=curlimages/curl --restart=Never --command -- \
+  curl -sS -X POST http://ms-iptables-api.ms-iptables.svc.cluster.local:18080/apply \
+  -H 'Content-Type: application/json' \
+  -d '{"defaultAction":"ALLOW","deployments":[{"namespace":"default","name":"client","egressTo":[{"namespace":"default","name":"web"}]}]}'
+
+kubectl -n ms-iptables delete pod curl --ignore-not-found
+sleep 35
+```
+
+2) 从 client Deployment 访问 web（预期成功）
+
+```bash
+CLIENT_POD=$(kubectl -n default get pod -l app=client -o jsonpath='{.items[0].metadata.name}')
+kubectl -n default exec "$CLIENT_POD" -- \
+  curl -sS -m 5 -o /dev/null -w 'HTTP:%{http_code}\n' http://$WEB_POD_IP:80
+```
+
+**预期结果**：`HTTP:200`
+
+3) 从 client Deployment 访问 api（ns2）（预期被拒绝）
+
+```bash
+kubectl -n default exec "$CLIENT_POD" -- \
+  curl -sS -m 5 -o /dev/null -w 'HTTP:%{http_code}\n' http://$NS2_SVC_IP:80
+```
+
+**预期结果**：`HTTP:000` + 超时
+
+## 十一、检查 iptables/ipset 规则（可选）
+
+```bash
+docker exec -i ms-dev-control-plane iptables -S MS-ROOT-OUT
+docker exec -i ms-dev-control-plane iptables -S MS-ROOT-IN
+docker exec -i ms-dev-control-plane ipset list
 ```
 
 预期规则示例（ALLOW /16）：
@@ -261,14 +331,14 @@ docker exec -i ms-dev-control-plane iptables -S MS-DEFAULT-WEB
 -A MS-DEFAULT-WEB -d <WEB_POD_IP>/32 -j DROP
 ```
 
-## 十一、清理测试资源（可选）
+## 十二、清理测试资源（可选）
 
 ```bash
 kubectl -n default delete pod client --ignore-not-found
 kubectl -n default delete deployment web --ignore-not-found
 ```
 
-## 十二、实测结果记录（本次）
+## 十三、实测结果记录（本次）
 
 环境：kind（K8s v1.28.6）+ Calico，`FORWARD_JUMP_POSITION=insert`
 
@@ -283,7 +353,7 @@ kubectl -n default delete deployment web --ignore-not-found
 - 从 `client` 访问 `web:80` 结果：
   - `HTTP:200`
 
-## 十三、当前测试资源清单（可直接复用）
+## 十四、当前测试资源清单（可直接复用）
 
 > 以下信息基于本次测试环境的实测输出，便于他人快速对照与复现。
 

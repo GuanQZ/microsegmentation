@@ -41,7 +41,7 @@
   - 默认 `insert`，可确保策略优先匹配。
   - 若担心影响 CNI，可切回 `append`。
 2. **策略生效范围**：
-  - 目前通过 Pod IP（目的地址）控制流量。
+  - 通过 Pod IP 控制入向/出向流量（白名单）。
 3. **策略存储**：
   - 默认仅内存；如需持久化使用 `POLICY_FILE`。
 
@@ -50,9 +50,9 @@
 主要模块：
 
 1. **控制器（Controller）**：核心同步逻辑，负责把集群状态和策略转成 iptables 规则。
-2. **iptables 适配层**：封装 `iptables` 命令执行，提供链创建、跳转和规则同步能力。
+2. **iptables 适配层**：封装 `iptables`/`ipset` 命令执行，提供链创建、跳转、规则同步与 IP 集合管理能力。
 3. **策略存储（PolicyStore）**：保存当前生效的策略；可选持久化到文件。
-4. **HTTP API 服务**：对外提供 `GET /policy` 和 `PUT /policy` 接口，用于管理端下发/读取策略。
+4. **HTTP API 服务**：对外提供 `GET /policy` 和 `POST /apply` 接口，用于管理端下发/读取策略。
 5. **Kubernetes Client**：访问集群 API，读取 `Deployment` 与本节点 `Pod`。
 
 ## 3. 核心运行流程
@@ -69,8 +69,8 @@
 1. **读取集群状态**：获取所有 `Deployment` 的标签选择器，并查询本节点上的 `Pod` 列表。
 2. **关联关系映射**：将 `Pod` 归属到对应的 `Deployment`，收集每个 `Deployment` 在本节点上的 Pod IP 列表。
 3. **读取策略**：从 `PolicyStore` 获取当前策略配置。
-4. **规则生成**：为每个 `Deployment` 生成独立链规则（目标为对应 Pod IP），应用策略动作。
-5. **规则下发**：确保根链与跳转规则存在，并把每个 `Deployment` 的规则同步到其专用链。
+4. **规则生成**：为每个 `Deployment` 生成入向/出向独立链规则（目标/源为对应 Pod IP），并同步白名单 ipset。
+5. **规则下发**：确保入向/出向根链与跳转规则存在，并把每个 `Deployment` 的规则同步到其专用链。
 
 ## 4. 关键设计点说明
 
@@ -89,7 +89,7 @@
 内置 HTTP API 简化了外部管理端对策略的控制：
 
 - `GET /policy`：查询当前策略。
-- `PUT /policy`：更新策略并立即生效（下一个同步周期内应用）。
+- `POST /apply`：更新策略并立即生效（下一个同步周期内应用）。
 
 可选 `API_TOKEN` 作为简单鉴权机制；可选 `POLICY_FILE` 用于策略持久化。
 
@@ -110,7 +110,7 @@
   - 将集群状态与策略转为 iptables 规则，并下发到节点。
 
 - [internal/controller/rules.go](../internal/controller/rules.go)
-  - `buildRulesForDeployment()`：根据策略为指定 `Deployment` 生成规则。
+  - `buildIngressRules()` / `buildEgressRules()`：根据策略为指定 `Deployment` 生成入向/出向白名单规则。
   - `normalizeAction()`：将 `ALLOW/DENY` 归一化成 iptables 动作（`ACCEPT/DROP`）。
 
 ### 5.3 策略与 API
@@ -120,17 +120,18 @@
   - `PolicyStore`：内存策略存储，可选文件持久化。
 
 - [internal/controller/api.go](../internal/controller/api.go)
-  - HTTP API 实现：`GET /policy` 和 `PUT /policy`。
+  - HTTP API 实现：`GET /policy` 和 `POST /apply`。
   - 简单 Token 鉴权（`X-API-Token`）。
 
 ### 5.4 iptables 封装
 
 - [internal/iptables/iptables.go](../internal/iptables/iptables.go)
-  - `RunCommand()`：统一执行系统 `iptables` 命令。
+  - `RunCommand()`：统一执行系统 `iptables`/`ipset` 命令。
   - `EnsureChain()`：保证链存在。
   - `EnsureJump()`：保证 FORWARD 链到根链的跳转（支持 `insert/append`）。
   - `SyncRules()`：清空并重建指定链的规则。
-  - `MakeChainName()`：生成合法链名。
+  - `EnsureIPSet()` / `SyncIPSet()`：创建并同步白名单 IP 集合。
+  - `MakeChainName()` / `MakeSetName()`：生成合法链/集合名称。
 
 ### 5.5 Kubernetes 客户端
 
@@ -164,14 +165,14 @@
 4. **查看日志**：
   - `kubectl -n ms-iptables logs -l app=ms-iptables --tail=200`
 5. **策略下发**：
-  - `PUT /policy`（参见 README 与 TESTING 文档）
+  - `POST /apply`（参见 README 与 TESTING 文档）
 
 ## 6.4 关键排错清单
 
 1. **策略未生效**：
-  - 检查 `FORWARD` 链中 `MS-ROOT-CHAIN` 是否在前面。
-  - 检查 `MS-ROOT-CHAIN` 内是否包含目标专用链。
-  - 检查专用链内规则是否包含期望条件（CIDR/端口）。
+  - 检查 `FORWARD` 链中 `MS-ROOT-OUT`/`MS-ROOT-IN` 是否在前面。
+  - 检查根链内是否包含目标专用链。
+  - 检查专用链与 ipset 是否包含期望条目。
 2. **API 不可访问**：
   - 检查 `ms-iptables-api` Service 是否存在。
   - 检查 Pod 内监听日志（`starting api server`）。
@@ -192,7 +193,7 @@ sequenceDiagram
   participant K as K8s API
   participant I as iptables
 
-  M->>A: PUT /policy (JSON策略)
+  M->>A: POST /apply (JSON策略)
   A->>S: Set(策略)
   A-->>M: 200 OK
 
@@ -227,21 +228,23 @@ flowchart TB
 
 ```mermaid
 flowchart LR
-  FWD[FORWARD链] -->|跳转| ROOT[MS-ROOT-CHAIN]
-  ROOT -->|跳转| D1[MS-<ns>-<deploy1>]
-  ROOT -->|跳转| D2[MS-<ns>-<deploy2>]
+  FWD[FORWARD链] -->|跳转| ROOT_OUT[MS-ROOT-OUT]
+  FWD -->|跳转| ROOT_IN[MS-ROOT-IN]
 
-  D1 -->|规则| R1[-d PodIP1 -j ACCEPT/DROP]
-  D1 -->|规则| R2[-d PodIP2 -j ACCEPT/DROP]
+  ROOT_OUT -->|跳转| O1[MS-OUT-<ns>-<deploy1>]
+  ROOT_OUT -->|跳转| O2[MS-OUT-<ns>-<deploy2>]
 
-  D2 -->|规则| R3[-d PodIP3 -j ACCEPT/DROP]
-  D2 -->|规则| R4[-d PodIP4 -j ACCEPT/DROP]
+  ROOT_IN -->|跳转| I1[MS-IN-<ns>-<deploy1>]
+  ROOT_IN -->|跳转| I2[MS-IN-<ns>-<deploy2>]
+
+  O1 -->|规则| R1[-s PodIP1 -m set dst -j RETURN/DROP]
+  I1 -->|规则| R2[-s PeerIP -m set src -j ACCEPT/DROP]
 ```
 
 说明：
-- `FORWARD` 链中会追加一条跳转到 `MS-ROOT-CHAIN` 的规则。
-- 根链对每个 Deployment 专用链做跳转。
-- 专用链内包含针对各 Pod IP 的规则，动作由策略决定（`ACCEPT/DROP/REJECT/RETURN`）。
+- `FORWARD` 链中会追加跳转到 `MS-ROOT-OUT` 与 `MS-ROOT-IN` 的规则。
+- 出向根链先做“我能访问谁”的白名单检查；入向根链再做“谁能访问我”的白名单检查。
+- 专用链内通过 ipset 匹配来源/去向集合，未命中则 DROP。
 
 ## 8. 策略 JSON 校验规则说明
 

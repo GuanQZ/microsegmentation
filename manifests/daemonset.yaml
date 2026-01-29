@@ -1,20 +1,20 @@
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: ms-iptables
+  name: microsegmentation
 
 ---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: ms-iptables-sa
-  namespace: ms-iptables
+  name: microsegmentation-sa
+  namespace: microsegmentation
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: ms-iptables-role
+  name: microsegmentation-role
 rules:
   - apiGroups: [""]
     resources: ["pods"]
@@ -27,38 +27,38 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: ms-iptables-binding
+  name: microsegmentation-binding
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: ms-iptables-role
+  name: microsegmentation-role
 subjects:
   - kind: ServiceAccount
-    name: ms-iptables-sa
-    namespace: ms-iptables
+    name: microsegmentation-sa
+    namespace: microsegmentation
 
 ---
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
-  name: ms-iptables
-  namespace: ms-iptables
+  name: microsegmentation
+  namespace: microsegmentation
 spec:
   selector:
     matchLabels:
-      app: ms-iptables
+      app: microsegmentation
   template:
     metadata:
       labels:
-        app: ms-iptables
+        app: microsegmentation
     spec:
-      serviceAccountName: ms-iptables-sa
+      serviceAccountName: microsegmentation-sa
       hostNetwork: true
       tolerations:
         - operator: Exists
       containers:
-        - name: ms-iptables
-          image: ms-iptables:latest
+        - name: microsegmentation
+          image: __IMAGE_PLACEHOLDER__
           imagePullPolicy: IfNotPresent
           env:
             - name: NODE_NAME
@@ -94,11 +94,27 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: ms-iptables-api
-  namespace: ms-iptables
+  name: microsegmentation-api
+  namespace: microsegmentation
 spec:
   selector:
-    app: ms-iptables
+    app: microsegmentation
+  ports:
+    - name: http
+      port: 18080
+      targetPort: 18080
+      protocol: TCP
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: microsegmentation-api-headless
+  namespace: microsegmentation
+spec:
+  clusterIP: None
+  selector:
+    app: microsegmentation
   ports:
     - name: http
       port: 18080

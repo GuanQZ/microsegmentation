@@ -29,6 +29,7 @@ func (s *APIServer) Handler() http.Handler {
     mux := http.NewServeMux()
     mux.HandleFunc("/healthz", s.handleHealthz)
     mux.HandleFunc("/policy", s.handlePolicy)
+    mux.HandleFunc("/apply", s.handleApply)
     return mux
 }
 
@@ -52,26 +53,40 @@ func (s *APIServer) handlePolicy(w http.ResponseWriter, r *http.Request) {
         w.Header().Set("Content-Type", "application/json")
         _ = json.NewEncoder(w).Encode(cfg)
         return
-    case http.MethodPut:
-        var cfg PolicyConfig
-        if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
-            w.WriteHeader(http.StatusBadRequest)
-            _, _ = w.Write([]byte("invalid json"))
-            return
-        }
-        if err := s.store.Set(cfg); err != nil {
-            log.Printf("set policy error: %v", err)
-            w.WriteHeader(http.StatusInternalServerError)
-            _, _ = w.Write([]byte("set policy failed"))
-            return
-        }
-        w.WriteHeader(http.StatusOK)
-        _, _ = w.Write([]byte("ok"))
-        return
     default:
         w.WriteHeader(http.StatusMethodNotAllowed)
         return
     }
+}
+
+// handleApply 处理策略下发（POST /apply）
+func (s *APIServer) handleApply(w http.ResponseWriter, r *http.Request) {
+    if !s.authorized(r) {
+        w.WriteHeader(http.StatusUnauthorized)
+        _, _ = w.Write([]byte("unauthorized"))
+        return
+    }
+
+    if r.Method != http.MethodPost {
+        w.WriteHeader(http.StatusMethodNotAllowed)
+        return
+    }
+
+    var cfg PolicyConfig
+    if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+        w.WriteHeader(http.StatusBadRequest)
+        _, _ = w.Write([]byte("invalid json"))
+        return
+    }
+    if err := s.store.Set(cfg); err != nil {
+        log.Printf("set policy error: %v", err)
+        w.WriteHeader(http.StatusInternalServerError)
+        _, _ = w.Write([]byte("set policy failed"))
+        return
+    }
+    w.WriteHeader(http.StatusOK)
+    _, _ = w.Write([]byte("ok"))
+    return
 }
 
 // authorized 根据 X-API-Token 头进行简单鉴权。

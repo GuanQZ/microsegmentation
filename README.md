@@ -38,8 +38,8 @@ kubectl apply -f manifests/daemonset.yaml
 - 容器需要 `NET_ADMIN` 能力以变更主机 iptables（清单已添加 capability）。另外建议以 `hostNetwork: true` 方式运行（清单已配置）。
 
 运行时注意：
-- 该程序在容器中执行系统 `iptables` 命令，因此镜像需包含 `iptables` 二进制（Dockerfile 已安装）。
-- 请确保容器运行用户有权限执行 `iptables`（通常需要 root 或 NET_ADMIN 能力）。
+- 该程序在容器中执行系统 `iptables`/`ipset` 命令，因此镜像需包含 `iptables` 与 `ipset` 二进制（Dockerfile 已安装）。
+- 请确保容器运行用户有权限执行 `iptables`/`ipset`（通常需要 root 或 NET_ADMIN 能力）。
 
 Calico 兼容性与冲突避免：
 - 本程序创建以 `MS-` 前缀命名的自定义链，并在 `FORWARD` 链上添加跳转。Calico 也会操作 iptables，可能会添加自己的链和跳转。为尽量减少冲突：
@@ -64,13 +64,13 @@ Calico 兼容性与冲突避免：
   A: 修改主机 iptables 最可靠方式是运行在主机网络命名空间（`hostNetwork: true`），也可通过特权容器和直接操作 `/run/netns` 实现更细粒度的方案。
 
 管理接口与策略配置：
-- 外部管理端通过 HTTP API 直接下发策略（PUT /policy）。
+- 外部管理端通过 HTTP API 直接下发策略（POST /apply）。
 - 默认监听 `:18080`，可通过环境变量 `API_BIND` 调整。
 - 若设置 `API_TOKEN`，请求需携带 `X-API-Token` 头。
 - 可选 `POLICY_FILE` 用于策略持久化（程序重启后恢复）。
 - 默认 `FORWARD_JUMP_POSITION=insert`，确保策略优先匹配；如需降低对 CNI 的影响可切换为 `append`。
 
-策略 JSON 结构（示例）：
+策略 JSON 结构（示例，白名单）：
 
 ```json
 {
@@ -79,9 +79,11 @@ Calico 兼容性与冲突避免：
     {
       "namespace": "default",
       "name": "web",
-      "rules": [
-        {"action": "ALLOW", "srcCIDR": "10.0.0.0/24", "protocol": "tcp", "port": 80},
-        {"action": "DENY", "srcCIDR": "0.0.0.0/0"}
+      "ingressFrom": [
+        {"namespace": "default", "name": "client"}
+      ],
+      "egressTo": [
+        {"namespace": "default", "name": "api"}
       ]
     }
   ]
@@ -89,20 +91,21 @@ Calico 兼容性与冲突避免：
 ```
 
 字段说明：
-- `defaultAction`: 当未配置具体规则或规则不匹配时的默认动作。支持：`ALLOW`(=ACCEPT)、`DENY`(=DROP)、`REJECT`、`RETURN`。
+- `defaultAction`: 兼容历史规则使用（CIDR/端口规则）。
 - `deployments`: Deployment 规则列表。
   - `namespace`: Deployment 所在命名空间。
   - `name`: Deployment 名称。
-  - `rules`: 规则列表。
-    - `action`: 动作。
-    - `srcCIDR`: 源地址 CIDR（可选）。
-    - `protocol`: 协议（可选，tcp/udp/icmp）。
-    - `port`: 目的端口（仅对 tcp/udp 生效，0 表示忽略）。
+  - `ingressFrom`: 允许访问该 Deployment 的来源 Deployment 白名单（为空则放行所有）。
+  - `egressTo`: 该 Deployment 允许访问的目标 Deployment 白名单（为空则放行所有）。
+  - `rules`: 兼容历史 CIDR/端口规则（未配置 ingressFrom 时生效）。
+
+性能说明：
+- 白名单会使用 ipset 聚合来源/去向 IP，避免规则在 Pod 数量增长时爆炸式扩张。
 
 外部管理端示例操作（HTTP）：
 
 ```bash
-curl -X PUT http://<node-ip>:18080/policy \
+curl -X POST http://<node-ip>:18080/apply \
   -H 'Content-Type: application/json' \
   -H 'X-API-Token: your-token' \
   -d @policy.json
@@ -117,7 +120,7 @@ curl http://<node-ip>:18080/policy -H 'X-API-Token: your-token'
 示例（集群内 Pod 中）：
 
 ```bash
-curl -X PUT http://ms-iptables-api.ms-iptables.svc.cluster.local:18080/policy \
+curl -X POST http://ms-iptables-api.ms-iptables.svc.cluster.local:18080/apply \
   -H 'Content-Type: application/json' \
   -H 'X-API-Token: your-token' \
   -d @policy.json

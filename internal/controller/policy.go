@@ -24,7 +24,21 @@ type PolicyConfig struct {
 type DeploymentPolicy struct {
     Namespace string `json:"namespace"`
     Name      string `json:"name"`
-    Rules     []Rule `json:"rules"`
+    // IngressFrom: 允许访问该 Deployment 的来源 Deployment 列表（白名单）。
+    // 若为空，表示不限制来源（放行所有）。
+    IngressFrom []DeploymentRef `json:"ingressFrom"`
+    // EgressTo: 该 Deployment 允许访问的目标 Deployment 列表（白名单）。
+    // 若为空，表示不限制去向（放行所有）。
+    EgressTo   []DeploymentRef `json:"egressTo"`
+    // Rules: 兼容历史策略（基于 CIDR/端口）。当 ingressFrom 未配置时仍可使用。
+    Rules      []Rule          `json:"rules"`
+}
+
+// DeploymentRef 表示一个 Deployment 引用（命名空间 + 名称）。
+// 用于白名单关联关系配置（谁能访问我 / 我能访问谁）。
+type DeploymentRef struct {
+    Namespace string `json:"namespace"`
+    Name      string `json:"name"`
 }
 
 // Rule 表示一条访问控制规则。
