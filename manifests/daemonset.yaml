@@ -1,0 +1,106 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ms-iptables
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ms-iptables-sa
+  namespace: ms-iptables
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ms-iptables-role
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get","list","watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get","list","watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ms-iptables-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ms-iptables-role
+subjects:
+  - kind: ServiceAccount
+    name: ms-iptables-sa
+    namespace: ms-iptables
+
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ms-iptables
+  namespace: ms-iptables
+spec:
+  selector:
+    matchLabels:
+      app: ms-iptables
+  template:
+    metadata:
+      labels:
+        app: ms-iptables
+    spec:
+      serviceAccountName: ms-iptables-sa
+      hostNetwork: true
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: ms-iptables
+          image: ms-iptables:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: API_BIND
+              value: ":18080"
+            # FORWARD 链跳转插入方式：insert（默认，优先生效）/ append（影响最小）
+            - name: FORWARD_JUMP_POSITION
+              value: "insert"
+            # 可选：设置 API 访问令牌（客户端需带 X-API-Token）
+            # - name: API_TOKEN
+            #   value: "your-token"
+            # 可选：策略持久化文件路径（为空则不落盘）
+            # - name: POLICY_FILE
+            #   value: "/var/lib/ms-iptables/policy.json"
+          securityContext:
+            capabilities:
+              add: ["NET_ADMIN"]
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+          ports:
+            - name: http
+              containerPort: 18080
+              protocol: TCP
+          volumeMounts: []
+      terminationGracePeriodSeconds: 30
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ms-iptables-api
+  namespace: ms-iptables
+spec:
+  selector:
+    app: ms-iptables
+  ports:
+    - name: http
+      port: 18080
+      targetPort: 18080
+      protocol: TCP
